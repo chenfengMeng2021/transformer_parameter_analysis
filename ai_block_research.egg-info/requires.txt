@@ -6,3 +6,4 @@ numpy>=1.24.0
 pandas>=2.0.0
 scikit-learn>=1.3.0
 matplotlib>=3.7.0
+cuml-cu12>=25.8.0

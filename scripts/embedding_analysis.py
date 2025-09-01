@@ -3,11 +3,12 @@
 """
 Embedding Analysis Script for Qwen3-4B
 Part 1: Load embedding tensors
-Part 2: K-means clustering with elbow method
+Part 2: K-means clustering with elbow method (GPU accelerated with cuML)
 """
 
 import argparse
 import json
+import time
 from pathlib import Path
 from typing import Tuple
 
@@ -15,8 +16,31 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from safetensors import safe_open
-from sklearn.cluster import KMeans
-from sklearn.preprocessing import StandardScaler
+
+# GPU-accelerated libraries
+try:
+    import cuml
+    from cuml.cluster import KMeans as cuKMeans
+    from cuml.preprocessing import StandardScaler as cuStandardScaler
+    from cuml.neighbors import NearestNeighbors as cuNearestNeighbors
+    GPU_AVAILABLE = True
+    print("✓ cuML GPU acceleration available")
+except ImportError:
+    print("⚠ cuML not available, falling back to scikit-learn")
+    from sklearn.cluster import KMeans
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.neighbors import NearestNeighbors
+    GPU_AVAILABLE = False
+
+# Fallback to scikit-learn if cuML fails
+if not GPU_AVAILABLE:
+    try:
+        from sklearn.cluster import KMeans
+        from sklearn.preprocessing import StandardScaler
+        from sklearn.neighbors import NearestNeighbors
+        print("✓ scikit-learn fallback available")
+    except ImportError:
+        raise ImportError("Neither cuML nor scikit-learn is available")
 
 
 def convert_tensor_dtype(tensor):
@@ -95,6 +119,31 @@ def load_tensor_from_shard(shard_path: Path, tensor_key: str) -> np.ndarray:
         return convert_tensor_dtype(tensor)
 
 
+def get_gpu_memory_info():
+    """Get GPU memory usage information."""
+    if GPU_AVAILABLE:
+        try:
+            import pynvml
+            pynvml.nvmlInit()
+            handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+            info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+            return {
+                'total': info.total / 1024**3,  # GB
+                'used': info.used / 1024**3,    # GB
+                'free': info.free / 1024**3     # GB
+            }
+        except:
+            return None
+    return None
+
+
+def print_gpu_memory_info():
+    """Print current GPU memory usage."""
+    gpu_info = get_gpu_memory_info()
+    if gpu_info:
+        print(f"GPU Memory: {gpu_info['used']:.1f}GB / {gpu_info['total']:.1f}GB (Free: {gpu_info['free']:.1f}GB)")
+
+
 # ============================================================================
 # PART 1: LOADING EMBEDDING TENSORS
 # ============================================================================
@@ -122,22 +171,41 @@ def load_embeddings(model_path: str) -> Tuple[str, np.ndarray]:
     print(f"Converted to numpy array with dtype: {tensor.dtype}")
     
     # Normalize embeddings for better clustering
-    scaler = StandardScaler()
-    tensor_normalized = scaler.fit_transform(tensor)
+    print("Normalizing embeddings...")
+    if GPU_AVAILABLE:
+        # Use GPU-accelerated scaling
+        scaler = cuStandardScaler()
+        tensor_normalized = scaler.fit_transform(tensor)
+        print("✓ GPU-accelerated normalization completed")
+    else:
+        # Fallback to CPU
+        scaler = StandardScaler()
+        tensor_normalized = scaler.fit_transform(tensor)
+        print("✓ CPU normalization completed")
+    
     print(f"Normalized embeddings shape: {tensor_normalized.shape}")
+    
+    if GPU_AVAILABLE:
+        print_gpu_memory_info()
     
     return key, tensor_normalized
 
 
 # ============================================================================
-# PART 2: K-MEANS CLUSTERING WITH ELBOW METHOD
+# PART 2: K-MEANS CLUSTERING WITH ELBOW METHOD (GPU ACCELERATED)
 # ============================================================================
 
-def find_optimal_clusters(embeddings: np.ndarray, max_k: int = 2000, random_state: int = 42) -> Tuple[int, list]:
-    """Find optimal number of clusters using two-stage elbow method."""
+def find_optimal_clusters(embeddings: np.ndarray, max_k: int = 2000, random_state: int = 42) -> Tuple[int, list, list]:
+    """Find optimal number of clusters using two-stage elbow method with GPU acceleration."""
     print("\n" + "=" * 60)
     print("PART 2: FINDING OPTIMAL NUMBER OF CLUSTERS")
     print("=" * 60)
+    
+    if GPU_AVAILABLE:
+        print("🚀 Using GPU-accelerated K-means clustering")
+        print_gpu_memory_info()
+    else:
+        print("💻 Using CPU-based K-means clustering")
     
     # Stage 1: Coarse search with large step size
     print("Stage 1: Coarse search with step size 100...")
@@ -149,17 +217,39 @@ def find_optimal_clusters(embeddings: np.ndarray, max_k: int = 2000, random_stat
     print(f"Testing K values: {coarse_k_values}")
     
     coarse_sse_values = []
-    for k in coarse_k_values:
+    stage1_start = time.time()
+    
+    for i, k in enumerate(coarse_k_values):
         print(f"  Testing K={k}...", end=" ")
-        kmeans = KMeans(n_clusters=k, random_state=random_state, n_init=10)
-        kmeans.fit(embeddings)
-        sse = kmeans.inertia_
+        start_time = time.time()
+        
+        if GPU_AVAILABLE:
+            # GPU-accelerated K-means
+            kmeans = cuKMeans(n_clusters=k, random_state=random_state, n_init=10)
+            kmeans.fit(embeddings)
+            sse = kmeans.inertia_
+        else:
+            # CPU fallback
+            kmeans = KMeans(n_clusters=k, random_state=random_state, n_init=10)
+            kmeans.fit(embeddings)
+            sse = kmeans.inertia_
+        
+        elapsed = time.time() - start_time
         coarse_sse_values.append(sse)
-        print(f"SSE: {sse:.2e}")
+        print(f"SSE: {sse:.2e} (Time: {elapsed:.2f}s)")
+        
+        # Progress update
+        if (i + 1) % 5 == 0:
+            print(f"    Progress: {i + 1}/{len(coarse_k_values)} completed")
+            if GPU_AVAILABLE:
+                print_gpu_memory_info()
+    
+    stage1_time = time.time() - stage1_start
+    print(f"\nStage 1 completed in {stage1_time:.2f}s")
     
     # Find rough elbow point from coarse search
     rough_elbow_k = find_elbow_point(coarse_k_values, coarse_sse_values)
-    print(f"\nRough elbow point found at K={rough_elbow_k}")
+    print(f"Rough elbow point found at K={rough_elbow_k}")
     
     # Stage 2: Fine search around rough elbow point
     print(f"\nStage 2: Fine search around K={rough_elbow_k}...")
@@ -177,13 +267,36 @@ def find_optimal_clusters(embeddings: np.ndarray, max_k: int = 2000, random_stat
     print(f"Fine search K values: {fine_k_values}")
     
     fine_sse_values = []
-    for k in fine_k_values:
+    stage2_start = time.time()
+    
+    for i, k in enumerate(fine_k_values):
         print(f"  Testing K={k}...", end=" ")
-        kmeans = KMeans(n_clusters=k, random_state=random_state, n_init=10)
-        kmeans.fit(embeddings)
-        sse = kmeans.inertia_
+        start_time = time.time()
+        
+        if GPU_AVAILABLE:
+            # GPU-accelerated K-means
+            kmeans = cuKMeans(n_clusters=k, random_state=random_state, n_init=10)
+            kmeans.fit(embeddings)
+            sse = kmeans.inertia_
+        else:
+            # CPU fallback
+            kmeans = KMeans(n_clusters=k, random_state=random_state, n_init=10)
+            kmeans.fit(embeddings)
+            sse = kmeans.inertia_
+        
+        elapsed = time.time() - start_time
         fine_sse_values.append(sse)
-        print(f"SSE: {sse:.2e}")
+        print(f"SSE: {sse:.2e} (Time: {elapsed:.2f}s)")
+        
+        # Progress update
+        if (i + 1) % 3 == 0:
+            print(f"    Progress: {i + 1}/{len(fine_k_values)} completed")
+            if GPU_AVAILABLE:
+                print_gpu_memory_info()
+    
+    stage2_time = time.time() - stage2_start
+    print(f"\nStage 2 completed in {stage2_time:.2f}s")
+    print(f"Total clustering time: {stage1_time + stage2_time:.2f}s")
     
     # Find optimal K from fine search
     optimal_k = find_elbow_point(fine_k_values, fine_sse_values)
@@ -239,7 +352,10 @@ def plot_elbow_curve(k_values: list, sse_values: list, optimal_k: int, output_pa
     # Add annotations
     plt.xlabel('Number of Clusters (K)', fontsize=12)
     plt.ylabel('Sum of Squared Errors (SSE)', fontsize=12)
-    plt.title('Two-Stage Elbow Method for Optimal K Selection', fontsize=14)
+    title = 'Two-Stage Elbow Method for Optimal K Selection'
+    if GPU_AVAILABLE:
+        title += ' (GPU Accelerated)'
+    plt.title(title, fontsize=14)
     plt.grid(True, alpha=0.3)
     plt.legend()
     
@@ -257,10 +373,22 @@ def perform_final_clustering(embeddings: np.ndarray, optimal_k: int, random_stat
     """Perform final clustering with optimal K and show results."""
     print(f"\nPerforming final clustering with K={optimal_k}...")
     
-    kmeans = KMeans(n_clusters=optimal_k, random_state=random_state, n_init=10)
-    cluster_labels = kmeans.fit_predict(embeddings)
+    start_time = time.time()
     
-    print(f"Clustering completed!")
+    if GPU_AVAILABLE:
+        # GPU-accelerated final clustering
+        kmeans = cuKMeans(n_clusters=optimal_k, random_state=random_state, n_init=10)
+        cluster_labels = kmeans.fit_predict(embeddings)
+        print("✓ GPU-accelerated final clustering completed")
+    else:
+        # CPU fallback
+        kmeans = KMeans(n_clusters=optimal_k, random_state=random_state, n_init=10)
+        cluster_labels = kmeans.fit_predict(embeddings)
+        print("✓ CPU final clustering completed")
+    
+    elapsed = time.time() - start_time
+    print(f"Final clustering completed in {elapsed:.2f}s!")
+    
     print(f"Cluster sizes:")
     unique, counts = np.unique(cluster_labels, return_counts=True)
     for cluster_id, count in zip(unique, counts):
@@ -275,7 +403,14 @@ def main():
     parser.add_argument("--output_dir", default="data/outputs", help="Output directory for plots")
     parser.add_argument("--max_k", type=int, default=2000, help="Maximum K to test (coarse search)")
     parser.add_argument("--random_state", type=int, default=42, help="Random seed for reproducibility")
+    parser.add_argument("--use_cpu", action="store_true", help="Force CPU usage even if GPU is available")
     args = parser.parse_args()
+    
+    # Override GPU availability if CPU is forced
+    global GPU_AVAILABLE
+    if args.use_cpu:
+        GPU_AVAILABLE = False
+        print("⚠ CPU mode forced by user")
     
     # Create output directory
     output_dir = Path(args.output_dir)
@@ -302,13 +437,20 @@ def main():
             "k_values": k_values,
             "cluster_labels": cluster_labels.tolist(),
             "cluster_centers": kmeans.cluster_centers_.tolist(),
-            "inertia": float(kmeans.inertia_)
+            "inertia": float(kmeans.inertia_),
+            "gpu_accelerated": GPU_AVAILABLE,
+            "total_tokens": len(embeddings),
+            "embedding_dimension": embeddings.shape[1]
         }
         
         results_path = output_dir / "clustering_results.json"
         with open(results_path, 'w') as f:
             json.dump(results, f, indent=2)
         print(f"Clustering results saved to: {results_path}")
+        
+        # Final GPU memory status
+        if GPU_AVAILABLE:
+            print_gpu_memory_info()
         
     except Exception as e:
         print(f"Error during analysis: {e}")

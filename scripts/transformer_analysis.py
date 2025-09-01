@@ -11,6 +11,14 @@ import numpy as np
 import torch
 from safetensors import safe_open
 
+# Check if CUDA is available
+CUDA_AVAILABLE = torch.cuda.is_available()
+if CUDA_AVAILABLE:
+    print(f"🚀 CUDA available: {torch.cuda.get_device_name(0)}")
+    print(f"   Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
+else:
+    print("⚠️  CUDA not available, using CPU")
+
 
 def classify_matrix_type(param_name: str) -> Tuple[str, int, str]:
     """Classify matrix type and extract layer index."""
@@ -53,29 +61,72 @@ def classify_matrix_type(param_name: str) -> Tuple[str, int, str]:
     return matrix_type, layer_idx, param_name
 
 
-def compute_matrix_stats(tensor: np.ndarray, rank_k: int = 128, zero_epsilon: float = 1e-8) -> Dict[str, Any]:
-    """Compute comprehensive matrix statistics including rank analysis."""
-    x2d = tensor.reshape(tensor.shape[0], -1) if tensor.ndim > 2 else tensor
+def compute_matrix_stats(tensor: np.ndarray, rank_k: int = 128, zero_epsilon: float = 1e-8, use_gpu: bool = True) -> Dict[str, Any]:
+    """Compute comprehensive matrix statistics including rank analysis and singular value analysis."""
+    # Handle 1D tensors (like layer norm weights)
+    if tensor.ndim == 1:
+        x2d = tensor.reshape(1, -1)
+    elif tensor.ndim > 2:
+        x2d = tensor.reshape(tensor.shape[0], -1)
+    else:
+        x2d = tensor
     
     # Design rank (theoretical minimum rank)
     design_rank = min(x2d.shape)
     
-    # Actual rank (numerical rank)
+    # Actual rank and singular value analysis
+    actual_rank = 0
+    svd_90_percent_rank = 0
+    
     try:
-        # Limit SVD computation for very large matrices
-        max_dim = min(1000, min(x2d.shape))
-        if x2d.shape[0] > max_dim or x2d.shape[1] > max_dim:
-            x2d_sample = x2d[:max_dim, :max_dim]
-            print(f"  Matrix too large {tensor.shape}, using sample {x2d_sample.shape} for SVD")
+        # Use GPU if available and requested
+        if use_gpu and CUDA_AVAILABLE:
+            # Convert to torch tensor and move to GPU
+            x2d_torch = torch.tensor(x2d, dtype=torch.float32, device='cuda')
+            
+            # Use torch SVD for GPU acceleration
+            try:
+                U, S, V = torch.linalg.svd(x2d_torch, full_matrices=False)
+                s = S.cpu().numpy()
+                print(f"  🚀 GPU SVD completed for matrix {tensor.shape}")
+            except torch.cuda.OutOfMemoryError:
+                print(f"  ⚠️  GPU OOM, falling back to CPU for matrix {tensor.shape}")
+                # Fall back to CPU with sampling for very large matrices
+                max_dim = min(2000, min(x2d.shape))
+                if x2d.shape[0] > max_dim or x2d.shape[1] > max_dim:
+                    x2d_sample = x2d[:max_dim, :max_dim]
+                    print(f"    Using CPU sample {x2d_sample.shape} for SVD")
+                    _, s, _ = np.linalg.svd(x2d_sample, full_matrices=False)
+                else:
+                    _, s, _ = np.linalg.svd(x2d, full_matrices=False)
         else:
-            x2d_sample = x2d
+            # CPU SVD with larger matrix support
+            max_dim = min(2000, min(x2d.shape))
+            if x2d.shape[0] > max_dim or x2d.shape[1] > max_dim:
+                x2d_sample = x2d[:max_dim, :max_dim]
+                print(f"  Matrix large {tensor.shape}, using CPU sample {x2d_sample.shape} for SVD")
+                _, s, _ = np.linalg.svd(x2d_sample, full_matrices=False)
+            else:
+                _, s, _ = np.linalg.svd(x2d, full_matrices=False)
         
-        _, s, _ = np.linalg.svd(x2d_sample, full_matrices=False)
+        # Actual rank (numerical rank)
         actual_rank = int((s > 1e-6 * s.max()).sum()) if s.size else 0
         actual_rank = min(actual_rank, rank_k)
+        
+        # Calculate how many singular values represent 90% of variance
+        if s.size > 0:
+            # Calculate total variance (sum of squared singular values)
+            total_variance = np.sum(s ** 2)
+            cumulative_variance = np.cumsum(s ** 2)
+            
+            # Find the number of singular values needed for 90% variance
+            svd_90_percent_rank = np.searchsorted(cumulative_variance, 0.9 * total_variance) + 1
+            svd_90_percent_rank = min(svd_90_percent_rank, s.size)
+            
     except Exception as e:
         print(f"  SVD failed: {e}")
         actual_rank = 0
+        svd_90_percent_rank = 0
     
     # Sparsity
     num_total = tensor.size
@@ -90,6 +141,8 @@ def compute_matrix_stats(tensor: np.ndarray, rank_k: int = 128, zero_epsilon: fl
         "design_rank": int(design_rank),
         "actual_rank": int(actual_rank),
         "rank_ratio": float(actual_rank / design_rank) if design_rank > 0 else 0.0,
+        "svd_90_percent_rank": int(svd_90_percent_rank),
+        "svd_90_percent_ratio": float(svd_90_percent_rank / design_rank) if design_rank > 0 else 0.0,
         "mean": float(tensor.mean()),
         "std": float(tensor.std()),
         "var": float(tensor.var()),
@@ -161,8 +214,77 @@ def load_model_tensors(model_dir: Path) -> List[Tuple[str, np.ndarray]]:
     return tensors
 
 
+def format_layer_analysis(results: List[Dict[str, Any]]) -> None:
+    """Format and display layer-by-layer matrix analysis."""
+    print("\n" + "="*80)
+    print("LAYER-BY-LAYER MATRIX ANALYSIS")
+    print("="*80)
+    
+    # Group results by layer
+    layer_groups = {}
+    for row in results:
+        layer_idx = row["layer_index"]
+        if layer_idx != "":
+            if layer_idx not in layer_groups:
+                layer_groups[layer_idx] = []
+            layer_groups[layer_idx].append(row)
+    
+    # Sort layers numerically
+    sorted_layers = sorted(layer_groups.keys(), key=lambda x: int(x) if x != "" else -1)
+    
+    for layer_idx in sorted_layers:
+        if layer_idx == "":
+            continue
+            
+        layer_matrices = layer_groups[layer_idx]
+        print(f"\n🔹 LAYER {layer_idx}")
+        print("-" * 50)
+        
+        # Sort matrices by type for consistent display
+        type_order = ["q_proj", "k_proj", "v_proj", "o_proj", "moe_gate", "moe_expert", "norm"]
+        sorted_matrices = sorted(layer_matrices, key=lambda x: type_order.index(x["block_type"]) if x["block_type"] in type_order else 999)
+        
+        for matrix in sorted_matrices:
+            matrix_type = matrix["block_type"]
+            shape = matrix["shape"]
+            rows = matrix["rows"]
+            cols = matrix["cols"]
+            design_rank = matrix["design_rank"]
+            actual_rank = matrix["actual_rank"]
+            svd_90_rank = matrix["svd_90_percent_rank"]
+            svd_90_ratio = matrix["svd_90_percent_ratio"]
+            sparsity = matrix["sparsity"]
+            mean = matrix["mean"]
+            std = matrix["std"]
+            
+            print(f"  📊 {matrix_type:12} | Shape: {shape:15} | Rank: {actual_rank:3}/{design_rank:3} ({actual_rank/design_rank*100:5.1f}%)")
+            print(f"      SVD 90%: {svd_90_rank:3}/{design_rank:3} ({svd_90_ratio*100:5.1f}%) | Sparsity: {sparsity*100:5.1f}% | μ={mean:8.4f} σ={std:8.4f}")
+    
+    # Show non-layer matrices (embedding, output, etc.)
+    non_layer_matrices = [row for row in results if row["layer_index"] == ""]
+    if non_layer_matrices:
+        print(f"\n🔹 NON-LAYER MATRICES")
+        print("-" * 50)
+        
+        for matrix in non_layer_matrices:
+            matrix_type = matrix["block_type"]
+            shape = matrix["shape"]
+            rows = matrix["rows"]
+            cols = matrix["cols"]
+            design_rank = matrix["design_rank"]
+            actual_rank = matrix["actual_rank"]
+            svd_90_rank = matrix["svd_90_percent_rank"]
+            svd_90_ratio = matrix["svd_90_percent_ratio"]
+            sparsity = matrix["sparsity"]
+            mean = matrix["mean"]
+            std = matrix["std"]
+            
+            print(f"  📊 {matrix_type:12} | Shape: {shape:15} | Rank: {actual_rank:3}/{design_rank:3} ({actual_rank/design_rank*100:5.1f}%)")
+            print(f"      SVD 90%: {svd_90_rank:3}/{design_rank:3} ({svd_90_ratio*100:5.1f}%) | Sparsity: {sparsity*100:5.1f}% | μ={mean:8.4f} σ={std:8.4f}")
+
+
 def analyze_transformer_model(model_path: str, out_csv: str, model_id: str | None = None, 
-                           revision: str | None = None, rank_k: int = 128) -> None:
+                           revision: str | None = None, rank_k: int = 128, use_gpu: bool = True) -> None:
     """Analyze all transformer matrices and output to CSV."""
     model_dir = Path(model_path)
     print(f"Analyzing transformer model at: {model_dir}")
@@ -180,7 +302,7 @@ def analyze_transformer_model(model_path: str, out_csv: str, model_id: str | Non
         matrix_type, layer_idx, full_name = classify_matrix_type(param_name)
         
         print(f"Analyzing: {param_name} ({matrix_type}, layer {layer_idx})")
-        stats = compute_matrix_stats(tensor, rank_k)
+        stats = compute_matrix_stats(tensor, rank_k, use_gpu=use_gpu)
         
         # Create result row
         row = {
@@ -196,6 +318,8 @@ def analyze_transformer_model(model_path: str, out_csv: str, model_id: str | Non
             "design_rank": stats["design_rank"],
             "actual_rank": stats["actual_rank"],
             "rank_ratio": stats["rank_ratio"],
+            "svd_90_percent_rank": stats["svd_90_percent_rank"],
+            "svd_90_percent_ratio": stats["svd_90_percent_ratio"],
             "mean": stats["mean"],
             "std": stats["std"],
             "var": stats["var"],
@@ -229,6 +353,9 @@ def analyze_transformer_model(model_path: str, out_csv: str, model_id: str | Non
         print("\nMatrix type summary:")
         for matrix_type, count in sorted(type_counts.items()):
             print(f"  {matrix_type}: {count}")
+        
+        # Format and display layer-by-layer analysis
+        format_layer_analysis(results)
     else:
         print("No tensors found to analyze")
 
@@ -240,9 +367,11 @@ def main() -> None:
     parser.add_argument("--model_id", default="Qwen/Qwen3-4B", help="Model ID for metadata")
     parser.add_argument("--revision", default=None, help="Revision for metadata")
     parser.add_argument("--rank_k", type=int, default=128, help="Maximum rank to compute (default: 128)")
+    parser.add_argument("--no_gpu", action="store_true", help="Disable GPU acceleration")
     args = parser.parse_args()
 
-    analyze_transformer_model(args.model_path, args.out, args.model_id, args.revision, args.rank_k)
+    use_gpu = not args.no_gpu
+    analyze_transformer_model(args.model_path, args.out, args.model_id, args.revision, args.rank_k, use_gpu)
 
 
 if __name__ == "__main__":
