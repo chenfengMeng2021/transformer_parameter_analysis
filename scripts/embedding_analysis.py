@@ -359,8 +359,8 @@ def plot_elbow_curve(k_values: list, sse_values: list, optimal_k: int, output_pa
     plt.grid(True, alpha=0.3)
     plt.legend()
     
-    # Use log scale for better visualization of large K values
-    plt.xscale('log')
+    # Use linear scale for better visualization
+    # plt.xscale('log')  # Commented out to use linear scale
     plt.yscale('log')
     
     plt.tight_layout()
@@ -369,7 +369,126 @@ def plot_elbow_curve(k_values: list, sse_values: list, optimal_k: int, output_pa
     plt.show()
 
 
-def perform_final_clustering(embeddings: np.ndarray, optimal_k: int, random_state: int = 42):
+def find_closest_tokens_to_centers(embeddings: np.ndarray, cluster_centers: np.ndarray, n_tokens: int = 10):
+    """Find the n closest tokens to each cluster center."""
+    print(f"\nFinding {n_tokens} closest tokens to each cluster center...")
+    
+    closest_tokens = {}
+    
+    if GPU_AVAILABLE:
+        # Use GPU-accelerated nearest neighbors
+        from cuml.neighbors import NearestNeighbors
+        nn = NearestNeighbors(n_neighbors=n_tokens, algorithm='brute')
+        nn.fit(embeddings)
+        
+        for i, center in enumerate(cluster_centers):
+            # Find closest tokens to this center
+            distances, indices = nn.kneighbors(center.reshape(1, -1))
+            closest_tokens[i] = {
+                'indices': indices[0].tolist(),
+                'distances': distances[0].tolist()
+            }
+    else:
+        # CPU fallback
+        from sklearn.neighbors import NearestNeighbors
+        nn = NearestNeighbors(n_neighbors=n_tokens, algorithm='brute')
+        nn.fit(embeddings)
+        
+        for i, center in enumerate(cluster_centers):
+            # Find closest tokens to this center
+            distances, indices = nn.kneighbors(center.reshape(1, -1))
+            closest_tokens[i] = {
+                'indices': indices[0].tolist(),
+                'distances': distances[0].tolist()
+            }
+    
+    return closest_tokens
+
+
+def decode_tokens(tokenizer, token_indices, max_length=50):
+    """Decode token indices to text using the tokenizer."""
+    try:
+        # Try to decode individual tokens
+        decoded_tokens = []
+        for idx in token_indices:
+            try:
+                # Decode single token
+                token_text = tokenizer.decode([idx], skip_special_tokens=True)
+                if token_text.strip():  # Only add non-empty tokens
+                    decoded_tokens.append(token_text)
+            except:
+                # If single token decoding fails, try with context
+                try:
+                    # Create a sequence with the token
+                    sequence = [idx] + [tokenizer.eos_token_id] if tokenizer.eos_token_id else [idx]
+                    token_text = tokenizer.decode(sequence, skip_special_tokens=True)
+                    if token_text.strip():
+                        decoded_tokens.append(token_text)
+                except:
+                    decoded_tokens.append(f"[TOKEN_{idx}]")
+        
+        # Join tokens and truncate if too long
+        result = " ".join(decoded_tokens)
+        if len(result) > max_length:
+            result = result[:max_length] + "..."
+        
+        return result
+    except Exception as e:
+        return f"[DECODE_ERROR: {e}]"
+
+
+def analyze_cluster_representatives(embeddings: np.ndarray, cluster_centers: np.ndarray, 
+                                  cluster_labels: np.ndarray, tokenizer=None, n_tokens: int = 10):
+    """Analyze and display representative tokens for each cluster."""
+    print(f"\n" + "=" * 60)
+    print("CLUSTER REPRESENTATIVE ANALYSIS")
+    print("=" * 60)
+    
+    # Find closest tokens to each center
+    closest_tokens = find_closest_tokens_to_centers(embeddings, cluster_centers, n_tokens)
+    
+    # Get cluster sizes
+    unique, counts = np.unique(cluster_labels, return_counts=True)
+    cluster_sizes = dict(zip(unique, counts))
+    
+    print(f"\nRepresentative tokens for each cluster (top {n_tokens} closest to center):")
+    print("-" * 80)
+    
+    cluster_analysis = {}
+    
+    for cluster_id in sorted(closest_tokens.keys()):
+        cluster_size = cluster_sizes.get(cluster_id, 0)
+        size_percentage = cluster_size / len(embeddings) * 100
+        
+        print(f"\nCluster {cluster_id} (Size: {cluster_size:,} tokens, {size_percentage:.1f}%):")
+        
+        # Get representative token indices
+        token_indices = closest_tokens[cluster_id]['indices']
+        distances = closest_tokens[cluster_id]['distances']
+        
+        # Decode tokens if tokenizer is available
+        if tokenizer:
+            representative_text = decode_tokens(tokenizer, token_indices)
+            print(f"  Representative tokens: {representative_text}")
+        else:
+            print(f"  Representative token indices: {token_indices[:5]}...")  # Show first 5
+        
+        print(f"  Average distance to center: {np.mean(distances):.4f}")
+        
+        # Store analysis results
+        cluster_analysis[cluster_id] = {
+            'size': cluster_size,
+            'percentage': size_percentage,
+            'token_indices': token_indices,
+            'distances': distances,
+            'representative_text': decode_tokens(tokenizer, token_indices) if tokenizer else None
+        }
+    
+    return cluster_analysis
+
+
+def perform_final_clustering(embeddings: np.ndarray, optimal_k: int, random_state: int = 42, 
+                           tokenizer=None, analyze_representatives: bool = True, n_representatives: int = 10):
     """Perform final clustering with optimal K and show results."""
     print(f"\nPerforming final clustering with K={optimal_k}...")
     
@@ -394,7 +513,15 @@ def perform_final_clustering(embeddings: np.ndarray, optimal_k: int, random_stat
     for cluster_id, count in zip(unique, counts):
         print(f"  Cluster {cluster_id}: {count} tokens ({count/len(embeddings)*100:.1f}%)")
     
-    return cluster_labels, kmeans
+    # Analyze cluster representatives if requested
+    cluster_analysis = None
+    if analyze_representatives:
+        cluster_analysis = analyze_cluster_representatives(
+            embeddings, kmeans.cluster_centers_, cluster_labels, 
+            tokenizer, n_representatives
+        )
+    
+    return cluster_labels, kmeans, cluster_analysis
 
 
 def main():
@@ -404,6 +531,8 @@ def main():
     parser.add_argument("--max_k", type=int, default=2000, help="Maximum K to test (coarse search)")
     parser.add_argument("--random_state", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument("--use_cpu", action="store_true", help="Force CPU usage even if GPU is available")
+    parser.add_argument("--n_representatives", type=int, default=10, help="Number of representative tokens per cluster")
+    parser.add_argument("--skip_representatives", action="store_true", help="Skip cluster representative analysis")
     args = parser.parse_args()
     
     # Override GPU availability if CPU is forced
@@ -420,6 +549,18 @@ def main():
         # PART 1: Load embeddings
         key, embeddings = load_embeddings(args.model_path)
         
+        # Try to load tokenizer for token decoding
+        tokenizer = None
+        try:
+            from transformers import AutoTokenizer
+            print("\nAttempting to load tokenizer for token decoding...")
+            # Try to load tokenizer from the same model directory
+            tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
+            print("✓ Tokenizer loaded successfully")
+        except Exception as e:
+            print(f"⚠ Could not load tokenizer: {e}")
+            print("  Token analysis will show token indices instead of decoded text")
+        
         # PART 2: Find optimal clusters and plot
         optimal_k, sse_values, k_values = find_optimal_clusters(embeddings, args.max_k, args.random_state)
         
@@ -427,8 +568,13 @@ def main():
         plot_path = output_dir / "elbow_curve.png"
         plot_elbow_curve(k_values, sse_values, optimal_k, str(plot_path))
         
-        # Perform final clustering
-        cluster_labels, kmeans = perform_final_clustering(embeddings, optimal_k, args.random_state)
+        # Perform final clustering with representative analysis
+        cluster_labels, kmeans, cluster_analysis = perform_final_clustering(
+            embeddings, optimal_k, args.random_state, 
+            tokenizer=tokenizer,
+            analyze_representatives=not args.skip_representatives,
+            n_representatives=args.n_representatives
+        )
         
         # Save clustering results
         results = {
@@ -440,13 +586,21 @@ def main():
             "inertia": float(kmeans.inertia_),
             "gpu_accelerated": GPU_AVAILABLE,
             "total_tokens": len(embeddings),
-            "embedding_dimension": embeddings.shape[1]
+            "embedding_dimension": embeddings.shape[1],
+            "cluster_analysis": cluster_analysis
         }
         
         results_path = output_dir / "clustering_results.json"
         with open(results_path, 'w') as f:
             json.dump(results, f, indent=2)
         print(f"Clustering results saved to: {results_path}")
+        
+        # Save detailed cluster analysis
+        if cluster_analysis:
+            analysis_path = output_dir / "cluster_representatives.json"
+            with open(analysis_path, 'w') as f:
+                json.dump(cluster_analysis, f, indent=2)
+            print(f"Cluster representatives saved to: {analysis_path}")
         
         # Final GPU memory status
         if GPU_AVAILABLE:
