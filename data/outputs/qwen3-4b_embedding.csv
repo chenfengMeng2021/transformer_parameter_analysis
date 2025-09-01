@@ -1,0 +1,2 @@
+model_path,model_id,revision,param_name,layer_index,block_type,shape,rows,cols,rank,mean,std,var,sparsity,dtype,created_at
+/Volumes/Backup/AI/models,Qwen/Qwen3-4B,,model.embed_tokens.weight,,embedding,"(151936, 2560)",151936,2560,128,2.934154326794669e-05,0.021953115239739418,0.00048193923430517316,3.882185591301601e-07,float32,2025-09-01T11:10:20.936090

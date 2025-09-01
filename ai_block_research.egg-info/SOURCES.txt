@@ -1,0 +1,6 @@
+pyproject.toml
+ai_block_research.egg-info/PKG-INFO
+ai_block_research.egg-info/SOURCES.txt
+ai_block_research.egg-info/dependency_links.txt
+ai_block_research.egg-info/requires.txt
+ai_block_research.egg-info/top_level.txt
