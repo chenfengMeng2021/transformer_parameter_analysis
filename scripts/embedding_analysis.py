@@ -195,10 +195,61 @@ def load_embeddings(model_path: str) -> Tuple[str, np.ndarray]:
 # PART 2: K-MEANS CLUSTERING WITH ELBOW METHOD (GPU ACCELERATED)
 # ============================================================================
 
-def find_optimal_clusters(embeddings: np.ndarray, max_k: int = 2000, random_state: int = 42) -> Tuple[int, list, list]:
-    """Find optimal number of clusters using two-stage elbow method with GPU acceleration."""
+def calculate_anova_f_ratio(embeddings: np.ndarray, cluster_labels: np.ndarray, cluster_centers: np.ndarray):
+    """Calculate ANOVA F-ratio for clustering quality assessment."""
+    # Remove clusters with only one member
+    unique_labels, counts = np.unique(cluster_labels, return_counts=True)
+    valid_clusters = unique_labels[counts > 1]
+    
+    if len(valid_clusters) < 2:
+        return 0.0, 0, 0  # Return 0 F-ratio if not enough valid clusters
+    
+    # Calculate total mean
+    total_mean = np.mean(embeddings, axis=0)
+    
+    # Calculate between-group sum of squares (SSB)
+    ssb = 0
+    total_n = 0
+    for cluster_id in valid_clusters:
+        cluster_mask = cluster_labels == cluster_id
+        cluster_size = np.sum(cluster_mask)
+        cluster_mean = cluster_centers[cluster_id]
+        
+        # Sum of squared differences between cluster mean and total mean
+        diff = cluster_mean - total_mean
+        ssb += cluster_size * np.sum(diff ** 2)
+        total_n += cluster_size
+    
+    # Calculate within-group sum of squares (SSW)
+    ssw = 0
+    for cluster_id in valid_clusters:
+        cluster_mask = cluster_labels == cluster_id
+        cluster_data = embeddings[cluster_mask]
+        cluster_center = cluster_centers[cluster_id]
+        
+        # Sum of squared differences within cluster
+        for point in cluster_data:
+            diff = point - cluster_center
+            ssw += np.sum(diff ** 2)
+    
+    # Calculate degrees of freedom
+    df_between = len(valid_clusters) - 1
+    df_within = total_n - len(valid_clusters)
+    
+    # Calculate mean squares
+    msb = ssb / df_between if df_between > 0 else 0
+    msw = ssw / df_within if df_within > 0 else 0
+    
+    # Calculate F-ratio
+    f_ratio = msb / msw if msw > 0 else 0
+    
+    return f_ratio, len(valid_clusters), total_n
+
+
+def find_optimal_clusters_anova(embeddings: np.ndarray, max_k: int = 2000, random_state: int = 42) -> Tuple[int, list, list, list]:
+    """Find optimal number of clusters using ANOVA F-ratio method with GPU acceleration."""
     print("\n" + "=" * 60)
-    print("PART 2: FINDING OPTIMAL NUMBER OF CLUSTERS")
+    print("PART 2: FINDING OPTIMAL NUMBER OF CLUSTERS (ANOVA METHOD)")
     print("=" * 60)
     
     if GPU_AVAILABLE:
@@ -216,7 +267,7 @@ def find_optimal_clusters(embeddings: np.ndarray, max_k: int = 2000, random_stat
     
     print(f"Testing K values: {coarse_k_values}")
     
-    coarse_sse_values = []
+    coarse_f_ratios = []
     stage1_start = time.time()
     
     for i, k in enumerate(coarse_k_values):
@@ -226,17 +277,20 @@ def find_optimal_clusters(embeddings: np.ndarray, max_k: int = 2000, random_stat
         if GPU_AVAILABLE:
             # GPU-accelerated K-means
             kmeans = cuKMeans(n_clusters=k, random_state=random_state, n_init=10)
-            kmeans.fit(embeddings)
-            sse = kmeans.inertia_
+            cluster_labels = kmeans.fit_predict(embeddings)
         else:
             # CPU fallback
             kmeans = KMeans(n_clusters=k, random_state=random_state, n_init=10)
-            kmeans.fit(embeddings)
-            sse = kmeans.inertia_
+            cluster_labels = kmeans.fit_predict(embeddings)
+        
+        # Calculate ANOVA F-ratio
+        f_ratio, valid_clusters, total_points = calculate_anova_f_ratio(
+            embeddings, cluster_labels, kmeans.cluster_centers_
+        )
         
         elapsed = time.time() - start_time
-        coarse_sse_values.append(sse)
-        print(f"SSE: {sse:.2e} (Time: {elapsed:.2f}s)")
+        coarse_f_ratios.append(f_ratio)
+        print(f"F-ratio: {f_ratio:.2e} (Valid clusters: {valid_clusters}, Time: {elapsed:.2f}s)")
         
         # Progress update
         if (i + 1) % 5 == 0:
@@ -247,15 +301,16 @@ def find_optimal_clusters(embeddings: np.ndarray, max_k: int = 2000, random_stat
     stage1_time = time.time() - stage1_start
     print(f"\nStage 1 completed in {stage1_time:.2f}s")
     
-    # Find rough elbow point from coarse search
-    rough_elbow_k = find_elbow_point(coarse_k_values, coarse_sse_values)
-    print(f"Rough elbow point found at K={rough_elbow_k}")
+    # Find rough optimal K from coarse search (highest F-ratio)
+    rough_optimal_k_idx = np.argmax(coarse_f_ratios)
+    rough_optimal_k = coarse_k_values[rough_optimal_k_idx]
+    print(f"Rough optimal K found at K={rough_optimal_k} (F-ratio: {coarse_f_ratios[rough_optimal_k_idx]:.2e})")
     
-    # Stage 2: Fine search around rough elbow point
-    print(f"\nStage 2: Fine search around K={rough_elbow_k}...")
-    fine_range = max(50, rough_elbow_k // 4)  # Search range around rough elbow
-    fine_start = max(1, rough_elbow_k - fine_range)
-    fine_end = min(max_k, rough_elbow_k + fine_range)
+    # Stage 2: Fine search around rough optimal point
+    print(f"\nStage 2: Fine search around K={rough_optimal_k}...")
+    fine_range = max(50, rough_optimal_k // 4)  # Search range around rough optimal
+    fine_start = max(1, rough_optimal_k - fine_range)
+    fine_end = min(max_k, rough_optimal_k + fine_range)
     
     fine_k_values = list(range(fine_start, fine_end + 1, 10))  # Step size 10 for fine search
     if fine_start > 1:
@@ -266,7 +321,7 @@ def find_optimal_clusters(embeddings: np.ndarray, max_k: int = 2000, random_stat
     print(f"Fine search range: K from {fine_start} to {fine_end}")
     print(f"Fine search K values: {fine_k_values}")
     
-    fine_sse_values = []
+    fine_f_ratios = []
     stage2_start = time.time()
     
     for i, k in enumerate(fine_k_values):
@@ -276,17 +331,20 @@ def find_optimal_clusters(embeddings: np.ndarray, max_k: int = 2000, random_stat
         if GPU_AVAILABLE:
             # GPU-accelerated K-means
             kmeans = cuKMeans(n_clusters=k, random_state=random_state, n_init=10)
-            kmeans.fit(embeddings)
-            sse = kmeans.inertia_
+            cluster_labels = kmeans.fit_predict(embeddings)
         else:
             # CPU fallback
             kmeans = KMeans(n_clusters=k, random_state=random_state, n_init=10)
-            kmeans.fit(embeddings)
-            sse = kmeans.inertia_
+            cluster_labels = kmeans.fit_predict(embeddings)
+        
+        # Calculate ANOVA F-ratio
+        f_ratio, valid_clusters, total_points = calculate_anova_f_ratio(
+            embeddings, cluster_labels, kmeans.cluster_centers_
+        )
         
         elapsed = time.time() - start_time
-        fine_sse_values.append(sse)
-        print(f"SSE: {sse:.2e} (Time: {elapsed:.2f}s)")
+        fine_f_ratios.append(f_ratio)
+        print(f"F-ratio: {f_ratio:.2e} (Valid clusters: {valid_clusters}, Time: {elapsed:.2f}s)")
         
         # Progress update
         if (i + 1) % 3 == 0:
@@ -298,20 +356,21 @@ def find_optimal_clusters(embeddings: np.ndarray, max_k: int = 2000, random_stat
     print(f"\nStage 2 completed in {stage2_time:.2f}s")
     print(f"Total clustering time: {stage1_time + stage2_time:.2f}s")
     
-    # Find optimal K from fine search
-    optimal_k = find_elbow_point(fine_k_values, fine_sse_values)
-    print(f"\nOptimal number of clusters: {optimal_k}")
+    # Find optimal K from fine search (highest F-ratio)
+    optimal_k_idx = np.argmax(fine_f_ratios)
+    optimal_k = fine_k_values[optimal_k_idx]
+    print(f"\nOptimal number of clusters: {optimal_k} (F-ratio: {fine_f_ratios[optimal_k_idx]:.2e})")
     
     # Combine results for plotting
     all_k_values = coarse_k_values + [k for k in fine_k_values if k not in coarse_k_values]
-    all_sse_values = coarse_sse_values + [fine_sse_values[fine_k_values.index(k)] for k in fine_k_values if k not in coarse_k_values]
+    all_f_ratios = coarse_f_ratios + [fine_f_ratios[fine_k_values.index(k)] for k in fine_k_values if k not in coarse_k_values]
     
     # Sort by K values
     sorted_indices = np.argsort(all_k_values)
     all_k_values = [all_k_values[i] for i in sorted_indices]
-    all_sse_values = [all_sse_values[i] for i in sorted_indices]
+    all_f_ratios = [all_f_ratios[i] for i in sorted_indices]
     
-    return optimal_k, all_sse_values, all_k_values
+    return optimal_k, all_f_ratios, all_k_values, fine_f_ratios
 
 
 def find_elbow_point(k_values: list, sse_values: list) -> int:
@@ -330,29 +389,29 @@ def find_elbow_point(k_values: list, sse_values: list) -> int:
     return k_values[elbow_idx]
 
 
-def plot_elbow_curve(k_values: list, sse_values: list, optimal_k: int, output_path: str):
-    """Plot SSE vs K curve with elbow point highlighted."""
+def plot_anova_curve(k_values: list, f_ratios: list, optimal_k: int, output_path: str):
+    """Plot F-ratio vs K curve with optimal point highlighted."""
     plt.figure(figsize=(12, 8))
     
-    # Plot SSE curve
-    plt.plot(k_values, sse_values, 'bo-', linewidth=2, markersize=6, label='SSE', alpha=0.7)
+    # Plot F-ratio curve
+    plt.plot(k_values, f_ratios, 'go-', linewidth=2, markersize=6, label='F-ratio', alpha=0.7)
     
     # Highlight optimal K point
     if optimal_k in k_values:
         optimal_idx = k_values.index(optimal_k)
-        plt.plot(optimal_k, sse_values[optimal_idx], 'ro', markersize=12, label=f'Optimal K={optimal_k}')
+        plt.plot(optimal_k, f_ratios[optimal_idx], 'ro', markersize=12, label=f'Optimal K={optimal_k}')
         
         # Add text annotation for optimal K
         plt.annotate(f'Optimal K = {optimal_k}', 
-                    xy=(optimal_k, sse_values[optimal_idx]),
-                    xytext=(optimal_k * 1.1, sse_values[optimal_idx] * 1.1),
+                    xy=(optimal_k, f_ratios[optimal_idx]),
+                    xytext=(optimal_k * 1.1, f_ratios[optimal_idx] * 1.1),
                     arrowprops=dict(arrowstyle='->', color='red', lw=2),
                     fontsize=12, color='red')
     
     # Add annotations
     plt.xlabel('Number of Clusters (K)', fontsize=12)
-    plt.ylabel('Sum of Squared Errors (SSE)', fontsize=12)
-    title = 'Two-Stage Elbow Method for Optimal K Selection'
+    plt.ylabel('ANOVA F-ratio', fontsize=12)
+    title = 'Two-Stage ANOVA F-ratio Method for Optimal K Selection'
     if GPU_AVAILABLE:
         title += ' (GPU Accelerated)'
     plt.title(title, fontsize=14)
@@ -365,7 +424,7 @@ def plot_elbow_curve(k_values: list, sse_values: list, optimal_k: int, output_pa
     
     plt.tight_layout()
     plt.savefig(output_path, dpi=300, bbox_inches='tight')
-    print(f"Elbow curve saved to: {output_path}")
+    print(f"ANOVA curve saved to: {output_path}")
     plt.show()
 
 
@@ -561,12 +620,12 @@ def main():
             print(f"⚠ Could not load tokenizer: {e}")
             print("  Token analysis will show token indices instead of decoded text")
         
-        # PART 2: Find optimal clusters and plot
-        optimal_k, sse_values, k_values = find_optimal_clusters(embeddings, args.max_k, args.random_state)
+        # PART 2: Find optimal clusters using ANOVA method
+        optimal_k, f_ratios, k_values, fine_f_ratios = find_optimal_clusters_anova(embeddings, args.max_k, args.random_state)
         
-        # Plot elbow curve
-        plot_path = output_dir / "elbow_curve.png"
-        plot_elbow_curve(k_values, sse_values, optimal_k, str(plot_path))
+        # Plot ANOVA curve
+        plot_path = output_dir / "anova_curve.png"
+        plot_anova_curve(k_values, f_ratios, optimal_k, str(plot_path))
         
         # Perform final clustering with representative analysis
         cluster_labels, kmeans, cluster_analysis = perform_final_clustering(
@@ -579,8 +638,9 @@ def main():
         # Save clustering results
         results = {
             "optimal_k": optimal_k,
-            "sse_values": sse_values,
+            "f_ratios": f_ratios,
             "k_values": k_values,
+            "fine_f_ratios": fine_f_ratios,
             "cluster_labels": cluster_labels.tolist(),
             "cluster_centers": kmeans.cluster_centers_.tolist(),
             "inertia": float(kmeans.inertia_),

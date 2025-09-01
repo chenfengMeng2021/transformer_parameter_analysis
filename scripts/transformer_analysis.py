@@ -111,7 +111,7 @@ def compute_matrix_stats(tensor: np.ndarray, rank_k: int = 128, zero_epsilon: fl
         
         # Actual rank (numerical rank)
         actual_rank = int((s > 1e-6 * s.max()).sum()) if s.size else 0
-        actual_rank = min(actual_rank, rank_k)
+        # Don't limit actual_rank by rank_k - we want to know the true rank
         
         # Calculate how many singular values represent 90% of variance
         if s.size > 0:
