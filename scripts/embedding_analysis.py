@@ -246,6 +246,33 @@ def calculate_anova_f_ratio(embeddings: np.ndarray, cluster_labels: np.ndarray, 
     return f_ratio, len(valid_clusters), total_n
 
 
+def calculate_silhouette_score(embeddings: np.ndarray, cluster_labels: np.ndarray, sample_size: int = 10000):
+    """Calculate silhouette score for clustering quality assessment."""
+    try:
+        from sklearn.metrics import silhouette_score
+        
+        # For large datasets, sample to speed up calculation
+        if len(embeddings) > sample_size:
+            np.random.seed(42)
+            indices = np.random.choice(len(embeddings), sample_size, replace=False)
+            sample_embeddings = embeddings[indices]
+            sample_labels = cluster_labels[indices]
+        else:
+            sample_embeddings = embeddings
+            sample_labels = cluster_labels
+        
+        # Calculate silhouette score
+        silhouette_avg = silhouette_score(sample_embeddings, sample_labels)
+        return silhouette_avg
+        
+    except ImportError:
+        print("⚠ sklearn.metrics not available for silhouette calculation")
+        return None
+    except Exception as e:
+        print(f"⚠ Error calculating silhouette score: {e}")
+        return None
+
+
 def find_optimal_clusters_anova(embeddings: np.ndarray, max_k: int = 2000, random_state: int = 42) -> Tuple[int, list, list, list]:
     """Find optimal number of clusters using ANOVA F-ratio method with GPU acceleration."""
     print("\n" + "=" * 60)
@@ -464,36 +491,121 @@ def find_closest_tokens_to_centers(embeddings: np.ndarray, cluster_centers: np.n
     return closest_tokens
 
 
-def decode_tokens(tokenizer, token_indices, max_length=50):
+def decode_tokens(tokenizer, token_indices, max_length=100):
     """Decode token indices to text using the tokenizer."""
     try:
-        # Try to decode individual tokens
+        # Try to decode as a sequence first
+        try:
+            # Decode the entire sequence
+            sequence_text = tokenizer.decode(token_indices, skip_special_tokens=True)
+            if sequence_text.strip():
+                # Clean up the text
+                cleaned_text = sequence_text.strip()
+                # Remove excessive whitespace
+                cleaned_text = ' '.join(cleaned_text.split())
+                if len(cleaned_text) > max_length:
+                    cleaned_text = cleaned_text[:max_length] + "..."
+                return cleaned_text
+        except:
+            pass
+        
+        # Fallback: decode individual tokens
         decoded_tokens = []
         for idx in token_indices:
             try:
-                # Decode single token
-                token_text = tokenizer.decode([idx], skip_special_tokens=True)
-                if token_text.strip():  # Only add non-empty tokens
-                    decoded_tokens.append(token_text)
-            except:
-                # If single token decoding fails, try with context
+                # Try different decoding strategies
+                token_text = None
+                
+                # Strategy 1: Single token decode
                 try:
-                    # Create a sequence with the token
-                    sequence = [idx] + [tokenizer.eos_token_id] if tokenizer.eos_token_id else [idx]
-                    token_text = tokenizer.decode(sequence, skip_special_tokens=True)
-                    if token_text.strip():
-                        decoded_tokens.append(token_text)
+                    token_text = tokenizer.decode([idx], skip_special_tokens=True)
                 except:
-                    decoded_tokens.append(f"[TOKEN_{idx}]")
+                    pass
+                
+                # Strategy 2: With EOS token
+                if not token_text or not token_text.strip():
+                    try:
+                        sequence = [idx]
+                        if tokenizer.eos_token_id:
+                            sequence.append(tokenizer.eos_token_id)
+                        token_text = tokenizer.decode(sequence, skip_special_tokens=True)
+                    except:
+                        pass
+                
+                # Strategy 3: With BOS and EOS tokens
+                if not token_text or not token_text.strip():
+                    try:
+                        sequence = []
+                        if tokenizer.bos_token_id:
+                            sequence.append(tokenizer.bos_token_id)
+                        sequence.append(idx)
+                        if tokenizer.eos_token_id:
+                            sequence.append(tokenizer.eos_token_id)
+                        token_text = tokenizer.decode(sequence, skip_special_tokens=True)
+                    except:
+                        pass
+                
+                # Add token if we got something meaningful
+                if token_text and token_text.strip():
+                    decoded_tokens.append(token_text.strip())
+                else:
+                    # Try to get token as string
+                    try:
+                        token_str = tokenizer.convert_ids_to_tokens(idx)
+                        if token_str and token_str != tokenizer.unk_token:
+                            decoded_tokens.append(token_str)
+                        else:
+                            decoded_tokens.append(f"[TOKEN_{idx}]")
+                    except:
+                        decoded_tokens.append(f"[TOKEN_{idx}]")
+                        
+            except Exception as e:
+                decoded_tokens.append(f"[ERROR_{idx}]")
         
-        # Join tokens and truncate if too long
-        result = " ".join(decoded_tokens)
-        if len(result) > max_length:
-            result = result[:max_length] + "..."
-        
-        return result
+        # Join tokens and clean up
+        if decoded_tokens:
+            result = " ".join(decoded_tokens)
+            # Remove excessive whitespace and special characters
+            result = ' '.join(result.split())
+            if len(result) > max_length:
+                result = result[:max_length] + "..."
+            return result
+        else:
+            return f"[NO_TOKENS_{len(token_indices)}]"
+            
     except Exception as e:
         return f"[DECODE_ERROR: {e}]"
+
+
+def extract_meaningful_text(decoded_text):
+    """Extract meaningful text from decoded tokens."""
+    if not decoded_text or decoded_text.startswith('['):
+        return decoded_text
+    
+    # Try to extract meaningful patterns
+    import re
+    
+    # Remove common token artifacts
+    text = decoded_text
+    
+    # Remove excessive punctuation
+    text = re.sub(r'[^\w\s\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff]', ' ', text)
+    
+    # Remove excessive whitespace
+    text = ' '.join(text.split())
+    
+    # Try to find Chinese characters
+    chinese_chars = re.findall(r'[\u4e00-\u9fff]+', text)
+    if chinese_chars:
+        return ' '.join(chinese_chars[:3])  # Return first 3 Chinese words
+    
+    # Try to find English words
+    english_words = re.findall(r'\b[a-zA-Z]{2,}\b', text)
+    if english_words:
+        return ' '.join(english_words[:5])  # Return first 5 English words
+    
+    # Return cleaned text
+    return text[:50] if len(text) > 50 else text
 
 
 def analyze_cluster_representatives(embeddings: np.ndarray, cluster_centers: np.ndarray, 
@@ -503,6 +615,12 @@ def analyze_cluster_representatives(embeddings: np.ndarray, cluster_centers: np.
     print("CLUSTER REPRESENTATIVE ANALYSIS")
     print("=" * 60)
     
+    # Calculate overall silhouette score
+    silhouette_avg = calculate_silhouette_score(embeddings, cluster_labels)
+    if silhouette_avg is not None:
+        print(f"Overall Silhouette Score: {silhouette_avg:.4f}")
+        print(f"Clustering Quality: {'Excellent' if silhouette_avg > 0.7 else 'Good' if silhouette_avg > 0.5 else 'Fair' if silhouette_avg > 0.25 else 'Poor'}")
+    
     # Find closest tokens to each center
     closest_tokens = find_closest_tokens_to_centers(embeddings, cluster_centers, n_tokens)
     
@@ -510,8 +628,13 @@ def analyze_cluster_representatives(embeddings: np.ndarray, cluster_centers: np.
     unique, counts = np.unique(cluster_labels, return_counts=True)
     cluster_sizes = dict(zip(unique, counts))
     
+    print(f"\nCluster Analysis Summary:")
+    print(f"Total clusters: {len(unique)}")
+    print(f"Clusters with >1 token: {sum(counts > 1)}")
+    print(f"Clusters with 1 token: {sum(counts == 1)}")
+    
     print(f"\nRepresentative tokens for each cluster (top {n_tokens} closest to center):")
-    print("-" * 80)
+    print("-" * 100)
     
     cluster_analysis = {}
     
@@ -519,7 +642,19 @@ def analyze_cluster_representatives(embeddings: np.ndarray, cluster_centers: np.
         cluster_size = cluster_sizes.get(cluster_id, 0)
         size_percentage = cluster_size / len(embeddings) * 100
         
-        print(f"\nCluster {cluster_id} (Size: {cluster_size:,} tokens, {size_percentage:.1f}%):")
+        # Calculate cluster silhouette score (for clusters with >1 member)
+        cluster_silhouette = None
+        if cluster_size > 1:
+            try:
+                from sklearn.metrics import silhouette_samples
+                cluster_mask = cluster_labels == cluster_id
+                cluster_embeddings = embeddings[cluster_mask]
+                cluster_silhouettes = silhouette_samples(embeddings, cluster_labels)
+                cluster_silhouette = np.mean(cluster_silhouettes[cluster_mask])
+            except:
+                pass
+        
+        print(f"\nCluster {cluster_id:2d} (Size: {cluster_size:6,} tokens, {size_percentage:5.1f}%):")
         
         # Get representative token indices
         token_indices = closest_tokens[cluster_id]['indices']
@@ -528,11 +663,15 @@ def analyze_cluster_representatives(embeddings: np.ndarray, cluster_centers: np.
         # Decode tokens if tokenizer is available
         if tokenizer:
             representative_text = decode_tokens(tokenizer, token_indices)
-            print(f"  Representative tokens: {representative_text}")
+            meaningful_text = extract_meaningful_text(representative_text)
+            print(f"  Raw tokens: {representative_text}")
+            print(f"  Meaningful: {meaningful_text}")
         else:
-            print(f"  Representative token indices: {token_indices[:5]}...")  # Show first 5
+            print(f"  Token indices: {token_indices[:5]}...")  # Show first 5
         
-        print(f"  Average distance to center: {np.mean(distances):.4f}")
+        print(f"  Avg distance: {np.mean(distances):.4f}")
+        if cluster_silhouette is not None:
+            print(f"  Silhouette: {cluster_silhouette:.4f}")
         
         # Store analysis results
         cluster_analysis[cluster_id] = {
@@ -540,7 +679,9 @@ def analyze_cluster_representatives(embeddings: np.ndarray, cluster_centers: np.
             'percentage': size_percentage,
             'token_indices': token_indices,
             'distances': distances,
-            'representative_text': decode_tokens(tokenizer, token_indices) if tokenizer else None
+            'representative_text': decode_tokens(tokenizer, token_indices) if tokenizer else None,
+            'meaningful_text': extract_meaningful_text(decode_tokens(tokenizer, token_indices)) if tokenizer else None,
+            'silhouette_score': float(cluster_silhouette) if cluster_silhouette is not None else None
         }
     
     return cluster_analysis
@@ -635,20 +776,38 @@ def main():
             n_representatives=args.n_representatives
         )
         
+        # Calculate overall silhouette score
+        overall_silhouette = calculate_silhouette_score(embeddings, cluster_labels)
+        
         # Save clustering results
         results = {
-            "optimal_k": optimal_k,
-            "f_ratios": f_ratios,
-            "k_values": k_values,
-            "fine_f_ratios": fine_f_ratios,
-            "cluster_labels": cluster_labels.tolist(),
-            "cluster_centers": kmeans.cluster_centers_.tolist(),
+            "optimal_k": int(optimal_k),
+            "f_ratios": [float(f) for f in f_ratios],
+            "k_values": [int(k) for k in k_values],
+            "fine_f_ratios": [float(f) for f in fine_f_ratios],
+            "cluster_labels": [int(l) for l in cluster_labels.tolist()],
+            "cluster_centers": [[float(c) for c in center] for center in kmeans.cluster_centers_.tolist()],
             "inertia": float(kmeans.inertia_),
+            "silhouette_score": float(overall_silhouette) if overall_silhouette is not None else None,
             "gpu_accelerated": GPU_AVAILABLE,
-            "total_tokens": len(embeddings),
-            "embedding_dimension": embeddings.shape[1],
-            "cluster_analysis": cluster_analysis
+            "total_tokens": int(len(embeddings)),
+            "embedding_dimension": int(embeddings.shape[1])
         }
+        
+        # Convert cluster_analysis to JSON-serializable format
+        if cluster_analysis:
+            serializable_analysis = {}
+            for cluster_id, analysis in cluster_analysis.items():
+                serializable_analysis[int(cluster_id)] = {
+                    "size": int(analysis['size']),
+                    "percentage": float(analysis['percentage']),
+                    "token_indices": [int(idx) for idx in analysis['token_indices']],
+                    "distances": [float(d) for d in analysis['distances']],
+                    "representative_text": analysis['representative_text'],
+                    "meaningful_text": analysis['meaningful_text'],
+                    "silhouette_score": analysis['silhouette_score']
+                }
+            results["cluster_analysis"] = serializable_analysis
         
         results_path = output_dir / "clustering_results.json"
         with open(results_path, 'w') as f:
