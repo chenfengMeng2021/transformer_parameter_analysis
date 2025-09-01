@@ -1,0 +1,73 @@
+# Model files (large files)
+data/models/*.safetensors
+data/models/tokenizer.json
+data/models/*.bin
+data/models/*.pt
+data/models/*.pth
+data/models/*.ckpt
+data/models/*.model
+
+# Output files
+data/outputs/*.csv
+data/outputs/*.json
+data/outputs/*.png
+data/outputs/*.jpg
+data/outputs/*.jpeg
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+*.tmp
+*.temp
