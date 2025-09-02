@@ -61,7 +61,7 @@ def classify_matrix_type(param_name: str) -> Tuple[str, int, str]:
     return matrix_type, layer_idx, param_name
 
 
-def compute_matrix_stats(tensor: np.ndarray, rank_k: int = 128, zero_epsilon: float = 1e-8, use_gpu: bool = True) -> Dict[str, Any]:
+def compute_matrix_stats(tensor: np.ndarray, zero_epsilon: float = 1e-8, use_gpu: bool = True) -> Dict[str, Any]:
     """Compute comprehensive matrix statistics including rank analysis and singular value analysis."""
     # Handle 1D tensors (like layer norm weights)
     if tensor.ndim == 1:
@@ -111,7 +111,6 @@ def compute_matrix_stats(tensor: np.ndarray, rank_k: int = 128, zero_epsilon: fl
         
         # Actual rank (numerical rank)
         actual_rank = int((s > 1e-6 * s.max()).sum()) if s.size else 0
-        # Don't limit actual_rank by rank_k - we want to know the true rank
         
         # Calculate how many singular values represent 90% of variance
         if s.size > 0:
@@ -284,7 +283,7 @@ def format_layer_analysis(results: List[Dict[str, Any]]) -> None:
 
 
 def analyze_transformer_model(model_path: str, out_csv: str, model_id: str | None = None, 
-                           revision: str | None = None, rank_k: int = 128, use_gpu: bool = True) -> None:
+                           revision: str | None = None, use_gpu: bool = True) -> None:
     """Analyze all transformer matrices and output to CSV."""
     model_dir = Path(model_path)
     print(f"Analyzing transformer model at: {model_dir}")
@@ -302,7 +301,7 @@ def analyze_transformer_model(model_path: str, out_csv: str, model_id: str | Non
         matrix_type, layer_idx, full_name = classify_matrix_type(param_name)
         
         print(f"Analyzing: {param_name} ({matrix_type}, layer {layer_idx})")
-        stats = compute_matrix_stats(tensor, rank_k, use_gpu=use_gpu)
+        stats = compute_matrix_stats(tensor, use_gpu=use_gpu)
         
         # Create result row
         row = {
@@ -333,6 +332,18 @@ def analyze_transformer_model(model_path: str, out_csv: str, model_id: str | Non
     
     # Write to CSV
     if results:
+        # Sort rows by numeric layer index (ascending). Non-layer rows ("") go last.
+        def _layer_sort_key(row: Dict[str, Any]):
+            layer_val = row["layer_index"]
+            is_non_layer = (layer_val == "")
+            if is_non_layer:
+                return (True, 10**9, row["param_name"])  # Non-layer rows last
+            numeric_layer = int(layer_val)
+            # Sort layers by numeric order (1, 2, 3, ...)
+            return (False, numeric_layer, row["param_name"])
+
+        results = sorted(results, key=_layer_sort_key)
+
         header = list(results[0].keys())
         Path(Path(out_csv).parent).mkdir(parents=True, exist_ok=True)
         
@@ -366,12 +377,12 @@ def main() -> None:
     parser.add_argument("--out", required=True, help="Output CSV path")
     parser.add_argument("--model_id", default="Qwen/Qwen3-4B", help="Model ID for metadata")
     parser.add_argument("--revision", default=None, help="Revision for metadata")
-    parser.add_argument("--rank_k", type=int, default=128, help="Maximum rank to compute (default: 128)")
+    # rank_k removed: always compute full numerical rank
     parser.add_argument("--no_gpu", action="store_true", help="Disable GPU acceleration")
     args = parser.parse_args()
 
     use_gpu = not args.no_gpu
-    analyze_transformer_model(args.model_path, args.out, args.model_id, args.revision, args.rank_k, use_gpu)
+    analyze_transformer_model(args.model_path, args.out, args.model_id, args.revision, use_gpu)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,8 @@
+{
+  "optimal_k": 5,
+  "silhouette_score": 0.06253864616155624,
+  "gpu_accelerated": true,
+  "total_tokens": 512,
+  "embedding_dimension": 768,
+  "clusters": []
+}

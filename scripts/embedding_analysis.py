@@ -18,6 +18,7 @@ import torch
 from safetensors import safe_open
 
 # GPU-accelerated libraries
+GPU_AVAILABLE = False
 try:
     import cuml
     from cuml.cluster import KMeans as cuKMeans
@@ -25,11 +26,8 @@ try:
     from cuml.neighbors import NearestNeighbors as cuNearestNeighbors
     GPU_AVAILABLE = True
     print("✓ cuML GPU acceleration available")
-except ImportError:
-    print("⚠ cuML not available, falling back to scikit-learn")
-    from sklearn.cluster import KMeans
-    from sklearn.preprocessing import StandardScaler
-    from sklearn.neighbors import NearestNeighbors
+except Exception as e:
+    print(f"⚠ cuML not available ({e}), falling back to scikit-learn")
     GPU_AVAILABLE = False
 
 # Fallback to scikit-learn if cuML fails
@@ -247,10 +245,20 @@ def calculate_anova_f_ratio(embeddings: np.ndarray, cluster_labels: np.ndarray, 
 
 
 def calculate_silhouette_score(embeddings: np.ndarray, cluster_labels: np.ndarray, sample_size: int = 10000):
-    """Calculate silhouette score for clustering quality assessment."""
+    """Calculate silhouette score for clustering quality assessment.
+
+    Purpose:
+        Prefer GPU-accelerated silhouette score via cuML if available; fallback to scikit-learn on CPU.
+
+    Inputs:
+        embeddings (np.ndarray): Shape [N, D], embedding matrix.
+        cluster_labels (np.ndarray): Shape [N], integer cluster labels.
+        sample_size (int): Subsample size threshold to limit computation cost.
+
+    Output:
+        float | None: Average silhouette score, or None on failure.
+    """
     try:
-        from sklearn.metrics import silhouette_score
-        
         # For large datasets, sample to speed up calculation
         if len(embeddings) > sample_size:
             np.random.seed(42)
@@ -260,17 +268,44 @@ def calculate_silhouette_score(embeddings: np.ndarray, cluster_labels: np.ndarra
         else:
             sample_embeddings = embeddings
             sample_labels = cluster_labels
-        
-        # Calculate silhouette score
-        silhouette_avg = silhouette_score(sample_embeddings, sample_labels)
-        return silhouette_avg
-        
+
+        # Try GPU path first
+        try:
+            import cupy as cp
+            from cuml.metrics.cluster import silhouette_score as gpu_silhouette_score
+            x_gpu = cp.asarray(sample_embeddings)
+            y_gpu = cp.asarray(sample_labels)
+            score = gpu_silhouette_score(x_gpu, y_gpu, metric="euclidean")
+            return float(score)
+        except Exception:
+            # Fallback to CPU (scikit-learn)
+            from sklearn.metrics import silhouette_score as cpu_silhouette_score
+            return float(cpu_silhouette_score(sample_embeddings, sample_labels))
     except ImportError:
-        print("⚠ sklearn.metrics not available for silhouette calculation")
+        print("⚠ Required libraries not available for silhouette calculation")
         return None
     except Exception as e:
         print(f"⚠ Error calculating silhouette score: {e}")
         return None
+
+
+def calculate_silhouette_score_filtered(embeddings: np.ndarray, cluster_labels: np.ndarray, sample_size: int = 10000):
+    """
+    Purpose: Compute silhouette after removing singleton clusters; return None if fewer than 2 clusters remain.
+
+    Inputs:
+    - embeddings (np.ndarray): Shape [N, D]
+    - cluster_labels (np.ndarray): Shape [N]
+    - sample_size (int): Optional subsample size
+
+    Output:
+    - float | None: Average silhouette on non-singleton clusters, or None if not applicable.
+    """
+    unique_labels, counts = np.unique(cluster_labels, return_counts=True)
+    valid = np.isin(cluster_labels, unique_labels[counts > 1])
+    if int((counts > 1).sum()) < 2 or valid.sum() < 3:
+        return None
+    return calculate_silhouette_score(embeddings[valid], cluster_labels[valid], sample_size=sample_size)
 
 
 def find_optimal_clusters_anova(embeddings: np.ndarray, max_k: int = 2000, random_state: int = 42) -> Tuple[int, list, list, list]:
@@ -285,9 +320,50 @@ def find_optimal_clusters_anova(embeddings: np.ndarray, max_k: int = 2000, rando
     else:
         print("💻 Using CPU-based K-means clustering")
     
-    # Stage 1: Coarse search with large step size
-    print("Stage 1: Coarse search with step size 100...")
-    coarse_step = 100
+    # Fast path: exhaustive search when max_k is small (≤ 50)
+    if max_k <= 50:
+        print(f"Fast exhaustive search for K=1..{max_k} (step=1)...")
+        k_values = list(range(1, max_k + 1))
+        f_ratios = []
+        start_time = time.time()
+        
+        for i, k in enumerate(k_values):
+            print(f"  Testing K={k}...", end=" ")
+            t0 = time.time()
+            
+            if GPU_AVAILABLE:
+                kmeans = cuKMeans(n_clusters=k, random_state=random_state, n_init=10)
+                cluster_labels = kmeans.fit_predict(embeddings)
+            else:
+                kmeans = KMeans(n_clusters=k, random_state=random_state, n_init=10)
+                cluster_labels = kmeans.fit_predict(embeddings)
+            
+            f_ratio, valid_clusters, total_points = calculate_anova_f_ratio(
+                embeddings, cluster_labels, kmeans.cluster_centers_
+            )
+            
+            elapsed = time.time() - t0
+            f_ratios.append(f_ratio)
+            print(f"F-ratio: {f_ratio:.2e} (Valid clusters: {valid_clusters}, Time: {elapsed:.2f}s)")
+            
+            if (i + 1) % 10 == 0 and GPU_AVAILABLE:
+                print_gpu_memory_info()
+        
+        total_time = time.time() - start_time
+        print(f"\nFast exhaustive search completed in {total_time:.2f}s")
+        optimal_k_idx = int(np.argmax(f_ratios))
+        optimal_k = k_values[optimal_k_idx]
+        print(f"\nOptimal number of clusters: {optimal_k} (F-ratio: {f_ratios[optimal_k_idx]:.2e})")
+        
+        # For compatibility with downstream plotting/serialization
+        all_k_values = k_values
+        all_f_ratios = f_ratios
+        fine_f_ratios = f_ratios
+        return optimal_k, all_f_ratios, all_k_values, fine_f_ratios
+    
+    # Stage 1: Coarse search with adaptive step size
+    coarse_step = max(10, max_k // 20)  # Adaptive step size based on max_k
+    print(f"Stage 1: Coarse search with step size {coarse_step}...")
     coarse_k_values = list(range(coarse_step, max_k + 1, coarse_step))
     if 1 not in coarse_k_values:
         coarse_k_values = [1] + coarse_k_values
@@ -335,11 +411,13 @@ def find_optimal_clusters_anova(embeddings: np.ndarray, max_k: int = 2000, rando
     
     # Stage 2: Fine search around rough optimal point
     print(f"\nStage 2: Fine search around K={rough_optimal_k}...")
-    fine_range = max(50, rough_optimal_k // 4)  # Search range around rough optimal
+    fine_range = max(5, rough_optimal_k // 8)  # Smaller search range for better precision
     fine_start = max(1, rough_optimal_k - fine_range)
     fine_end = min(max_k, rough_optimal_k + fine_range)
     
-    fine_k_values = list(range(fine_start, fine_end + 1, 10))  # Step size 10 for fine search
+    # Adaptive fine step size based on range
+    fine_step = max(1, fine_range // 10)  # Ensure at least 10 points in fine search
+    fine_k_values = list(range(fine_start, fine_end + 1, fine_step))
     if fine_start > 1:
         fine_k_values = [1] + fine_k_values
     if fine_end not in fine_k_values:
@@ -626,8 +704,8 @@ def analyze_cluster_representatives(embeddings: np.ndarray, cluster_centers: np.
     print("CLUSTER REPRESENTATIVE ANALYSIS")
     print("=" * 60)
     
-    # Calculate overall silhouette score
-    silhouette_avg = calculate_silhouette_score(embeddings, cluster_labels)
+    # Calculate overall silhouette score (exclude singleton clusters)
+    silhouette_avg = calculate_silhouette_score_filtered(embeddings, cluster_labels)
     if silhouette_avg is not None:
         print(f"Overall Silhouette Score: {silhouette_avg:.4f}")
         print(f"Clustering Quality: {'Excellent' if silhouette_avg > 0.7 else 'Good' if silhouette_avg > 0.5 else 'Fair' if silhouette_avg > 0.25 else 'Poor'}")
@@ -652,16 +730,30 @@ def analyze_cluster_representatives(embeddings: np.ndarray, cluster_centers: np.
     for cluster_id in sorted(closest_tokens.keys()):
         cluster_size = cluster_sizes.get(cluster_id, 0)
         size_percentage = cluster_size / len(embeddings) * 100
+
+        # Skip singleton clusters in final outputs
+        if cluster_size == 1:
+            continue
         
         # Calculate cluster silhouette score (for clusters with >1 member)
         cluster_silhouette = None
         if cluster_size > 1:
             try:
-                from sklearn.metrics import silhouette_samples
-                cluster_mask = cluster_labels == cluster_id
-                cluster_embeddings = embeddings[cluster_mask]
-                cluster_silhouettes = silhouette_samples(embeddings, cluster_labels)
-                cluster_silhouette = np.mean(cluster_silhouettes[cluster_mask])
+                # Try GPU with cuML first
+                try:
+                    import cupy as cp
+                    from cuml.metrics.cluster import silhouette_samples as gpu_silhouette_samples
+                    cluster_mask = cluster_labels == cluster_id
+                    s_all = gpu_silhouette_samples(cp.asarray(embeddings), cp.asarray(cluster_labels), metric="euclidean")
+                    # s_all is a CuPy array; index then convert to float
+                    s_cluster = s_all[cp.asarray(cluster_mask)]
+                    cluster_silhouette = float(cp.mean(s_cluster).item())
+                except Exception:
+                    # CPU fallback using sklearn
+                    from sklearn.metrics import silhouette_samples as cpu_silhouette_samples
+                    cluster_mask = cluster_labels == cluster_id
+                    s_all = cpu_silhouette_samples(embeddings, cluster_labels)
+                    cluster_silhouette = float(np.mean(s_all[cluster_mask]))
             except:
                 pass
         
@@ -684,12 +776,11 @@ def analyze_cluster_representatives(embeddings: np.ndarray, cluster_centers: np.
         if cluster_silhouette is not None:
             print(f"  Silhouette: {cluster_silhouette:.4f}")
         
-        # Store analysis results
+        # Store compact analysis results
         cluster_analysis[cluster_id] = {
-            'size': cluster_size,
-            'percentage': size_percentage,
-            'token_indices': token_indices,
-            'distances': distances,
+            'size': int(cluster_size),
+            'percentage': float(size_percentage),
+            'avg_distance': float(np.mean(distances)) if len(distances) else None,
             'representative_text': decode_tokens(tokenizer, token_indices) if tokenizer else None,
             'meaningful_text': extract_meaningful_text(decode_tokens(tokenizer, token_indices)) if tokenizer else None,
             'silhouette_score': float(cluster_silhouette) if cluster_silhouette is not None else None
@@ -739,7 +830,7 @@ def main():
     parser = argparse.ArgumentParser(description="Analyze embeddings with K-means clustering and elbow method")
     parser.add_argument("--model_path", required=True, help="Path to model directory")
     parser.add_argument("--output_dir", default="data/outputs", help="Output directory for plots")
-    parser.add_argument("--max_k", type=int, default=2000, help="Maximum K to test (coarse search)")
+    parser.add_argument("--max_k", type=int, default=100, help="Maximum K to test (coarse search)")
     parser.add_argument("--random_state", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument("--use_cpu", action="store_true", help="Force CPU usage even if GPU is available")
     parser.add_argument("--n_representatives", type=int, default=10, help="Number of representative tokens per cluster")
@@ -787,50 +878,55 @@ def main():
             n_representatives=args.n_representatives
         )
         
-        # Calculate overall silhouette score
-        overall_silhouette = calculate_silhouette_score(embeddings, cluster_labels)
+        # Calculate overall silhouette score (exclude singleton clusters)
+        overall_silhouette = calculate_silhouette_score_filtered(embeddings, cluster_labels)
         
-        # Save clustering results
-        results = {
+        # Save compact, human-readable clustering summary
+        compact = {
             "optimal_k": int(optimal_k),
-            "f_ratios": [float(f) for f in f_ratios],
-            "k_values": [int(k) for k in k_values],
-            "fine_f_ratios": [float(f) for f in fine_f_ratios],
-            "cluster_labels": [int(l) for l in cluster_labels.tolist()],
-            "cluster_centers": [[float(c) for c in center] for center in kmeans.cluster_centers_.tolist()],
-            "inertia": float(kmeans.inertia_),
             "silhouette_score": float(overall_silhouette) if overall_silhouette is not None else None,
-            "gpu_accelerated": GPU_AVAILABLE,
+            "gpu_accelerated": bool(GPU_AVAILABLE),
             "total_tokens": int(len(embeddings)),
-            "embedding_dimension": int(embeddings.shape[1])
+            "embedding_dimension": int(embeddings.shape[1]),
+            "clusters": []
         }
-        
-        # Convert cluster_analysis to JSON-serializable format
         if cluster_analysis:
-            serializable_analysis = {}
-            for cluster_id, analysis in cluster_analysis.items():
-                serializable_analysis[int(cluster_id)] = {
-                    "size": int(analysis['size']),
-                    "percentage": float(analysis['percentage']),
-                    "token_indices": [int(idx) for idx in analysis['token_indices']],
-                    "distances": [float(d) for d in analysis['distances']],
-                    "representative_text": analysis['representative_text'],
-                    "meaningful_text": analysis['meaningful_text'],
-                    "silhouette_score": analysis['silhouette_score']
-                }
-            results["cluster_analysis"] = serializable_analysis
-        
+            for cid in sorted(cluster_analysis.keys()):
+                ca = cluster_analysis[cid]
+                compact["clusters"].append({
+                    "cluster_id": int(cid),
+                    "size": int(ca.get('size') or 0),
+                    "percentage": float(ca.get('percentage') or 0.0),
+                    "avg_distance": float(ca.get('avg_distance')) if ca.get('avg_distance') is not None else None,
+                    "representative_text": ca.get('representative_text'),
+                    "meaningful_text": ca.get('meaningful_text'),
+                    "silhouette_score": float(ca.get('silhouette_score')) if ca.get('silhouette_score') is not None else None,
+                })
+
         results_path = output_dir / "clustering_results.json"
         with open(results_path, 'w') as f:
-            json.dump(results, f, indent=2)
+            json.dump(compact, f, indent=2, ensure_ascii=False)
         print(f"Clustering results saved to: {results_path}")
-        
-        # Save detailed cluster analysis
-        if cluster_analysis:
-            analysis_path = output_dir / "cluster_representatives.json"
-            with open(analysis_path, 'w') as f:
-                json.dump(cluster_analysis, f, indent=2)
-            print(f"Cluster representatives saved to: {analysis_path}")
+
+        # Also write a CSV table summary for quick human review
+        try:
+            import csv
+            csv_path = output_dir / "embedding_clusters_summary.csv"
+            with open(csv_path, 'w', newline='', encoding='utf-8') as cf:
+                writer = csv.writer(cf)
+                writer.writerow(["cluster_id", "size", "percentage", "avg_distance", "silhouette_score", "meaningful_text"])
+                for c in compact.get("clusters", []):
+                    writer.writerow([
+                        c.get("cluster_id"),
+                        c.get("size"),
+                        f"{c.get('percentage'):.2f}",
+                        f"{c.get('avg_distance'):.4f}" if c.get('avg_distance') is not None else "",
+                        f"{c.get('silhouette_score'):.4f}" if c.get('silhouette_score') is not None else "",
+                        c.get("meaningful_text") or "",
+                    ])
+            print(f"Cluster summary CSV saved to: {csv_path}")
+        except Exception as e:
+            print(f"⚠ Failed to write CSV summary: {e}")
         
         # Final GPU memory status
         if GPU_AVAILABLE:

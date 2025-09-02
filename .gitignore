@@ -1,4 +1,5 @@
 # Model files (large files)
+data/models/
 data/models/*.safetensors
 data/models/tokenizer.json
 data/models/*.bin
