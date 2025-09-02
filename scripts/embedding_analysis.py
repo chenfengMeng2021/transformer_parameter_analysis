@@ -417,7 +417,18 @@ def find_elbow_point(k_values: list, sse_values: list) -> int:
 
 
 def plot_anova_curve(k_values: list, f_ratios: list, optimal_k: int, output_path: str):
-    """Plot F-ratio vs K curve with optimal point highlighted."""
+    """
+    Purpose: Plot the ANOVA F-ratio across different K values and highlight the optimal K.
+
+    Inputs:
+    - k_values (list): Monotonic list of tested cluster counts K used for ANOVA.
+    - f_ratios (list): ANOVA F-ratio values corresponding to each K in k_values.
+    - optimal_k (int): The selected optimal number of clusters to highlight on the plot.
+    - output_path (str): Filesystem path where the generated plot image will be saved.
+
+    Output:
+    - None: Saves the plot to output_path and shows the figure.
+    """
     plt.figure(figsize=(12, 8))
     
     # Plot F-ratio curve
@@ -445,9 +456,9 @@ def plot_anova_curve(k_values: list, f_ratios: list, optimal_k: int, output_path
     plt.grid(True, alpha=0.3)
     plt.legend()
     
-    # Use linear scale for better visualization
-    # plt.xscale('log')  # Commented out to use linear scale
-    plt.yscale('log')
+    # Use linear scale for better visualization to avoid hiding near-zero values
+    # plt.xscale('log')  # Keep X linear
+    # plt.yscale('log')  # Do not use log scale on Y to preserve pre-optimal curve
     
     plt.tight_layout()
     plt.savefig(output_path, dpi=300, bbox_inches='tight')
