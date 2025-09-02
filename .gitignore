@@ -71,3 +71,12 @@ logs/
 # Temporary files
 *.tmp
 *.temp
+
+# Output model artifacts (keep docs)
+output/models/*
+!output/models/*.md
+!output/models/*.MD
+!output/models/*.markdown
+!output/models/*.txt
+!output/models/README*
+!output/models/LICENSE*
