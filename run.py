@@ -176,9 +176,19 @@ def run_embedding_analysis(model_dir: Path, output_dir: Path, use_cpu: bool) -> 
     anova_plot = output_dir / "anova_curve.png"
     clustering_json = output_dir / "clustering_results.json"
     representatives_json = output_dir / "cluster_representatives.json"
-    if clustering_json.exists() and anova_plot.exists():
-        print(f"Reusing existing embedding outputs in: {output_dir}")
-        return anova_plot, clustering_json, representatives_json
+    summary_csv = output_dir / "embedding_clusters_summary.csv"
+    # Reuse only if all key artifacts exist and summary CSV has data rows
+    reuse_ok = anova_plot.exists() and clustering_json.exists() and summary_csv.exists()
+    if reuse_ok:
+        try:
+            # Ensure summary has more than header
+            with open(summary_csv, 'r', encoding='utf-8') as f:
+                has_rows = sum(1 for _ in f) > 1
+            if has_rows:
+                print(f"Reusing existing embedding outputs in: {output_dir}")
+                return anova_plot, clustering_json, representatives_json
+        except Exception:
+            pass
 
     cmd = [
         sys.executable,
@@ -186,7 +196,6 @@ def run_embedding_analysis(model_dir: Path, output_dir: Path, use_cpu: bool) -> 
         "--model_path", str(model_dir),
         "--output_dir", str(output_dir),
         "--max_k", "100",
-        "--skip_representatives",
     ]
     if use_cpu:
         cmd.append("--use_cpu")
